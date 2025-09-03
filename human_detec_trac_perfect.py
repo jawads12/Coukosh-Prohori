@@ -1,26 +1,28 @@
 """
-Rapoo Script3: Advanced Human Pose-Based Tracking with Rapoo Camera
-Optimized for Rapoo Camera at Full HD (1920x1080 @ 30 FPS)
-
+Script3: Clean Person Tracking Pipeline
 Workflow:
-1. Capture Frame from Rapoo USB camera (index 2)
-2. Detect Humans using YOLOv8 Pose Detection (17 keypoints)
-3. Validate human shape using keypoint analysis
-4. Track humans with DeepSORT
-5. Automatically target the largest/closest validated human
-6. Compute Human Chest Center using shoulder/hip keypoints
-7. Compare with Frame Center and calculate error values
-
-Features:
-- Full HD 1920x1080 @ 30 FPS for maximum quality
-- Human-only detection using pose keypoints
-- Advanced keypoint validation (shoulders, head, hips, limbs)
-- Chest center calculation using anatomical landmarks
-- Distance compensation for accurate tracking
-- Auto-selection of largest valid human
+1. Capture Frame from camera
+2. Detect Humans (YOLO)
+3. Automatically target the largest/closest person
+4. Compu            # Step 4: Compute Target Center (cx, cy) - Using chest center with distance compensation
+            target_center = None
+            if selected_track_id is not None and selected_track_id in active_tracks:
+                bbox = active_tracks[selected_track_id]
+                cx, cy = get_human_chest_center(bbox)  # Get chest center instead of bbox center
+                target_center = (cx, cy)
+                
+                # Calculate distance info for debugging
+                x1, y1, x2, y2 = bbox
+                box_area = (x2 - x1) * (y2 - y1)
+                distance_category = "Very Close" if box_area > 25000 else 
+                                  "Close" if box_area > 15000 else 
+                                  "Medium" if box_area > 8000 else 
+                                  "Far" if box_area > 4000 else "Very Far"an Chest Center (cx, cy) - Upper body focus
+5. Compare with Frame Center (fx, fy)
+6. Generate Error Values (dx, dy)
 
 Controls:
-- Automatically selects the largest detected human
+- Automatically selects the largest detected person
 - Press 'q' to quit
 - Press 'n' to cycle through detected persons
 """
@@ -34,8 +36,8 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 # Fix Qt warnings
 os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
-# Configuration - Optimized for Rapoo Camera
-CAM_INDEX = 0              # Rapoo camera index
+# Configuration
+CAM_INDEX = 0              # Default webcam
 CONF_THRES = 0.4          # YOLO confidence threshold (lowered for better detection)
 TARGET_CLASS = 0          # Person class ID
 
@@ -43,7 +45,7 @@ TARGET_CLASS = 0          # Person class ID
 selected_track_id = None
 person_cycle_index = 0
 
-# Human keypoint indices for YOLOv8 pose model (17 keypoints)
+# Human keypoint indices for YOLOv8 pose model
 KEYPOINT_NAMES = [
     'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
     'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
@@ -88,186 +90,152 @@ def validate_human_keypoints(keypoints, confidence_threshold=0.3):
     
     return is_human, reason
 
-def create_human_shape_bbox(keypoints, padding=10):
-    """Create a tight bounding box around detected human keypoints"""
+def create_human_shape_bbox(keypoints, padding_ratio=0.15):
+    """Create tight bounding box around actual human keypoints only"""
     if keypoints is None or len(keypoints) == 0:
         return None
     
+    # Extract valid keypoints (confidence > 0.3)
     valid_points = []
     for kp in keypoints:
         if len(kp) >= 3:
             x, y, conf = kp[:3]
             if conf > 0.3 and x > 0 and y > 0:
-                valid_points.append((x, y))
+                valid_points.append([x, y])
     
-    if len(valid_points) < 3:  # Need at least 3 points for a meaningful bbox
+    if len(valid_points) < 3:  # Need at least 3 points for meaningful bbox
         return None
     
-    # Find bounding box of all valid keypoints
-    xs = [p[0] for p in valid_points]
-    ys = [p[1] for p in valid_points]
+    valid_points = np.array(valid_points)
     
-    x1 = max(0, min(xs) - padding)
-    y1 = max(0, min(ys) - padding)
-    x2 = max(xs) + padding
-    y2 = max(ys) + padding
+    # Find tight bounding box around keypoints
+    x_min, y_min = np.min(valid_points, axis=0)
+    x_max, y_max = np.max(valid_points, axis=0)
+    
+    # Add padding to ensure we don't crop the human
+    width = x_max - x_min
+    height = y_max - y_min
+    
+    x_padding = width * padding_ratio
+    y_padding = height * padding_ratio
+    
+    x1 = max(0, x_min - x_padding)
+    y1 = max(0, y_min - y_padding)
+    x2 = x_max + x_padding
+    y2 = y_max + y_padding
     
     return [int(x1), int(y1), int(x2), int(y2)]
 
 def get_human_chest_center_from_keypoints(keypoints):
-    """Calculate chest center using shoulder and hip keypoints for anatomical accuracy"""
-    if keypoints is None or len(keypoints) == 0:
+    """Calculate chest center using shoulder and hip keypoints"""
+    if keypoints is None or len(keypoints) < 17:
         return None, None
     
-    # Extract key body landmarks
-    left_shoulder = keypoints[5] if len(keypoints) > 5 else [0, 0, 0]
-    right_shoulder = keypoints[6] if len(keypoints) > 6 else [0, 0, 0]
-    left_hip = keypoints[11] if len(keypoints) > 11 else [0, 0, 0]
-    right_hip = keypoints[12] if len(keypoints) > 12 else [0, 0, 0]
+    # Get shoulder and hip coordinates
+    left_shoulder = keypoints[5][:3] if len(keypoints[5]) >= 3 else [0, 0, 0]
+    right_shoulder = keypoints[6][:3] if len(keypoints[6]) >= 3 else [0, 0, 0]
+    left_hip = keypoints[11][:3] if len(keypoints[11]) >= 3 else [0, 0, 0]
+    right_hip = keypoints[12][:3] if len(keypoints[12]) >= 3 else [0, 0, 0]
     
-    # Collect valid shoulder points
-    shoulder_points = []
-    if len(left_shoulder) >= 3 and left_shoulder[2] > 0.3:
-        shoulder_points.append((left_shoulder[0], left_shoulder[1]))
-    if len(right_shoulder) >= 3 and right_shoulder[2] > 0.3:
-        shoulder_points.append((right_shoulder[0], right_shoulder[1]))
+    # Find valid points for chest calculation
+    valid_shoulders = []
+    valid_hips = []
     
-    # Collect valid hip points
-    hip_points = []
-    if len(left_hip) >= 3 and left_hip[2] > 0.3:
-        hip_points.append((left_hip[0], left_hip[1]))
-    if len(right_hip) >= 3 and right_hip[2] > 0.3:
-        hip_points.append((right_hip[0], right_hip[1]))
+    if left_shoulder[2] > 0.3:  # confidence > 0.3
+        valid_shoulders.append(left_shoulder[:2])
+    if right_shoulder[2] > 0.3:
+        valid_shoulders.append(right_shoulder[:2])
+    if left_hip[2] > 0.3:
+        valid_hips.append(left_hip[:2])
+    if right_hip[2] > 0.3:
+        valid_hips.append(right_hip[:2])
     
-    # Calculate chest center based on available landmarks
-    if shoulder_points and hip_points:
-        # Ideal case: use midpoint between shoulder center and hip center
-        shoulder_center_x = sum([p[0] for p in shoulder_points]) / len(shoulder_points)
-        shoulder_center_y = sum([p[1] for p in shoulder_points]) / len(shoulder_points)
+    # Calculate chest center
+    if len(valid_shoulders) >= 1 and len(valid_hips) >= 1:
+        # Use average of shoulders and hips
+        shoulder_center = np.mean(valid_shoulders, axis=0)
+        hip_center = np.mean(valid_hips, axis=0)
         
-        hip_center_x = sum([p[0] for p in hip_points]) / len(hip_points)
-        hip_center_y = sum([p[1] for p in hip_points]) / len(hip_points)
+        # Chest is between shoulders and hips (closer to shoulders)
+        chest_x = shoulder_center[0]
+        chest_y = shoulder_center[1] + (hip_center[1] - shoulder_center[1]) * 0.3
         
-        # Chest is approximately 1/3 of the way from shoulders to hips
-        chest_x = shoulder_center_x + 0.3 * (hip_center_x - shoulder_center_x)
-        chest_y = shoulder_center_y + 0.3 * (hip_center_y - shoulder_center_y)
-        
-    elif shoulder_points:
-        # Use shoulder center and estimate chest position
-        chest_x = sum([p[0] for p in shoulder_points]) / len(shoulder_points)
-        chest_y = sum([p[1] for p in shoulder_points]) / len(shoulder_points) + 40  # Offset down for chest
-        
-    elif hip_points:
-        # Use hip center and estimate chest position
-        chest_x = sum([p[0] for p in hip_points]) / len(hip_points)
-        chest_y = sum([p[1] for p in hip_points]) / len(hip_points) - 60  # Offset up for chest
-        
-    else:
-        # Fallback: use any available high-confidence keypoints
-        valid_points = []
-        for kp in keypoints:
-            if len(kp) >= 3 and kp[2] > 0.4:
-                valid_points.append((kp[0], kp[1]))
-        
-        if valid_points:
-            chest_x = sum([p[0] for p in valid_points]) / len(valid_points)
-            chest_y = sum([p[1] for p in valid_points]) / len(valid_points)
-        else:
-            return None, None
+        return chest_x, chest_y
     
-    return chest_x, chest_y
+    elif len(valid_shoulders) >= 1:
+        # Use shoulders only, estimate chest below
+        shoulder_center = np.mean(valid_shoulders, axis=0)
+        chest_x = shoulder_center[0]
+        chest_y = shoulder_center[1] + 50  # Estimate chest 50 pixels below shoulders
+        
+        return chest_x, chest_y
+    
+    return None, None
 
 def get_largest_person(active_tracks):
-    """Find the largest person among active tracks (closest/most prominent)"""
+    """Get the track ID of the largest valid detected person (closest/most prominent)"""
     if not active_tracks:
         return None
     
-    largest_id = None
     largest_area = 0
+    largest_tid = None
     
-    for tid, (bbox, keypoints) in active_tracks.items():
+    for tid, track_data in active_tracks.items():
+        bbox, keypoints = track_data
         x1, y1, x2, y2 = bbox
-        area = (x2 - x1) * (y2 - y1)
         
-        # Validate this is a real human
+        # Validate using keypoints instead of bounding box
         is_valid, _ = validate_human_keypoints(keypoints)
         
-        if is_valid and area > largest_area:
-            largest_area = area
-            largest_id = tid
+        if is_valid:
+            area = (x2 - x1) * (y2 - y1)
+            if area > largest_area:
+                largest_area = area
+                largest_tid = tid
     
-    return largest_id
+    return largest_tid
 
 def main():
     global selected_track_id, person_cycle_index
     
-    print("=== Rapoo Camera - Human Pose-Based Tracking Pipeline ===")
+    print("=== Human Pose-Based Tracking Pipeline ===")
     print("1. Loading YOLOv8 Pose model...")
     model = YOLO('yolov8n-pose.pt')  # Use pose detection model
     
     print("2. Initializing DeepSORT tracker...")
     tracker = DeepSort(max_age=30, n_init=3)
     
-    print("3. Setting up Rapoo camera...")
+    print("3. Setting up camera...")
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
-        print(f"Error: Cannot open Rapoo camera at index {CAM_INDEX}")
-        print("Make sure your Rapoo camera is connected and try different indices (0, 1, 2, 3)")
+        print(f"Error: Cannot open camera {CAM_INDEX}")
         return
     
-    # Rapoo Camera settings for BEST QUALITY (Based on your specs)
-    print("4. Configuring camera for maximum quality...")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)    # Full HD width
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)   # Full HD height  
-    cap.set(cv2.CAP_PROP_FPS, 30)              # 30 FPS as per specs
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)        # Reduce latency
+    # Camera settings for best quality
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
-    # Enhanced quality settings for Rapoo camera
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.6)      # Optimal brightness
-    cap.set(cv2.CAP_PROP_CONTRAST, 0.7)        # Good contrast for detection
-    cap.set(cv2.CAP_PROP_SATURATION, 0.6)      # Natural colors
-    cap.set(cv2.CAP_PROP_SHARPNESS, 0.8)       # High sharpness for keypoint detection
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Auto exposure
-    cap.set(cv2.CAP_PROP_GAIN, 0.3)           # Low gain for clean image
+    print(f"Camera resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     
-    # Get actual camera settings
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    # Setup window
+    cv2.namedWindow("Human Pose Tracking - Chest Center", cv2.WINDOW_NORMAL)
     
-    print(f"=== Rapoo Camera Configuration ===")
-    print(f"Resolution: {actual_width}x{actual_height}")
-    print(f"FPS: {actual_fps}")
-    print(f"Brightness: {cap.get(cv2.CAP_PROP_BRIGHTNESS)}")
-    print(f"Contrast: {cap.get(cv2.CAP_PROP_CONTRAST)}")
-    print(f"Saturation: {cap.get(cv2.CAP_PROP_SATURATION)}")
-    print(f"Sharpness: {cap.get(cv2.CAP_PROP_SHARPNESS)}")
-    print("================================")
-    
-    # Setup display window (scaled down for viewing)
-    cv2.namedWindow("Rapoo - Human Pose Tracking (Full HD)", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Rapoo - Human Pose Tracking (Full HD)", 1280, 720)  # Display size
-    
-    print("5. Starting human pose tracking pipeline...")
-    print("   - Full HD capture: 1920x1080 @ 30 FPS")
-    print("   - Uses keypoint detection for accurate human identification") 
+    print("4. Starting human pose tracking pipeline...")
+    print("   - Uses keypoint detection for accurate human identification")
     print("   - Focuses on chest center using shoulder/hip joints")
     print("   - Press 'q' to quit")
     
     try:
         while True:
-            # Step 1: Capture Frame from Rapoo camera
+            # Step 1: Capture Frame from camera
             ret, frame = cap.read()
             if not ret:
-                print("Failed to capture frame from Rapoo camera")
+                print("Failed to capture frame")
                 break
             
             H, W = frame.shape[:2]
-            fx, fy = W / 2.0, H / 2.0  # Frame center
-            
-            # Draw frame center crosshair
-            cv2.drawMarker(frame, (int(fx), int(fy)), (255, 255, 255), 
-                          cv2.MARKER_CROSS, 20, 2)
             
             # Step 2: Detect Humans with Pose (YOLOv8-pose)
             results = model.predict(source=frame, verbose=False, conf=CONF_THRES)
@@ -318,10 +286,10 @@ def main():
                     bbox = track.to_ltrb()  # left, top, right, bottom
                     x1, y1, x2, y2 = map(int, bbox)
                     
-                    # Find corresponding keypoints
+                    # Find corresponding keypoints (this is simplified - in practice you'd need better matching)
                     keypoints = None
                     if pose_data:
-                        # Use the first available keypoints (simplified matching)
+                        # Use the first available keypoints (this could be improved)
                         keypoints = list(pose_data.values())[0] if pose_data else None
                     
                     active_tracks[tid] = ([x1, y1, x2, y2], keypoints)
@@ -346,8 +314,25 @@ def main():
                 if cx is not None and cy is not None:
                     target_center = (cx, cy)
             
-            # Step 5: Draw all tracked humans
-            for tid, (bbox, keypoints) in active_tracks.items():
+            # Step 5: Compare with Frame Center (fx, fy)
+            fx, fy = W / 2.0, H / 2.0
+            
+            # Step 6: Generate Error Values (dx, dy)
+            dx, dy = 0, 0
+            if target_center is not None:
+                cx, cy = target_center
+                dx = cx - fx
+                dy = cy - fy
+            
+            # === VISUALIZATION ===
+            
+            # Draw frame center
+            cv2.line(frame, (int(fx - 10), int(fy)), (int(fx + 10), int(fy)), (0, 255, 255), 2)
+            cv2.line(frame, (int(fx), int(fy - 10)), (int(fx), int(fy + 10)), (0, 255, 255), 2)
+            
+            # Draw all detected humans with keypoints
+            for tid, track_data in active_tracks.items():
+                bbox, keypoints = track_data
                 x1, y1, x2, y2 = bbox
                 
                 # Color: Green for selected target, Blue for others
@@ -372,8 +357,15 @@ def main():
                     chest_cx, chest_cy = get_human_chest_center_from_keypoints(keypoints)
                     if chest_cx is not None and chest_cy is not None:
                         cv2.circle(frame, (int(chest_cx), int(chest_cy)), 8, color, -1)
-                        cv2.putText(frame, f"ID: {tid}", (x1, y1 - 10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        
+                        # Draw cross-hair on chest center for selected target
+                        if tid == selected_track_id:
+                            cv2.line(frame, (int(chest_cx - 12), int(chest_cy)), (int(chest_cx + 12), int(chest_cy)), (0, 255, 255), 3)
+                            cv2.line(frame, (int(chest_cx), int(chest_cy - 12)), (int(chest_cx), int(chest_cy + 12)), (0, 255, 255), 3)
+                    
+                    # Draw track ID
+                    cv2.putText(frame, f"ID: {tid} (HUMAN)", (x1, y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 else:
                     # This shouldn't happen with pose detection, but just in case
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
@@ -394,10 +386,6 @@ def main():
                 frame_area = W * H
                 coverage = (box_area / frame_area) * 100
                 
-                # Calculate error values (target center vs frame center)
-                dx = cx - fx  # horizontal error
-                dy = cy - fy  # vertical error
-                
                 # Count visible keypoints
                 visible_keypoints = 0
                 if keypoints:
@@ -412,47 +400,43 @@ def main():
                 
                 # Draw line from frame center to target center
                 cv2.arrowedLine(frame, (int(fx), int(fy)), (int(cx), int(cy)), 
-                               (0, 255, 255), 3, tipLength=0.1)
+                               (0, 255, 255), 2, tipLength=0.1)
                 
-                # Display target coordinates on Full HD frame
+                # Display target coordinates
                 cv2.putText(frame, f"Chest Center: ({int(cx)}, {int(cy)})", 
-                           (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
                 # Display error values
                 cv2.putText(frame, f"Error (dx, dy): ({int(dx)}, {int(dy)})", 
-                           (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
                 # Display human validation information
                 cv2.putText(frame, f"Distance: {distance_category} | Keypoints: {visible_keypoints}/17 | HUMAN VALIDATED", 
-                           (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Display target info
-                cv2.putText(frame, f"Target: Human ID {selected_track_id} (Full HD Pose-Based Tracking)", 
-                           (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+                cv2.putText(frame, f"Target: Human ID {selected_track_id} (Pose-Based Tracking)", 
+                           (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Print error values to console with enhanced info
-                print(f"ID: {selected_track_id} | Chest: ({int(cx)}, {int(cy)}) | Error: ({int(dx)}, {int(dy)}) | {distance_category} | Keypoints: {visible_keypoints}/17 | HUMAN | Coverage: {coverage:.1f}%")
+                print(f"ID: {selected_track_id} | Chest: ({int(cx)}, {int(cy)}) | Error: ({int(dx)}, {int(dy)}) | {distance_category} | Keypoints: {visible_keypoints}/17 | HUMAN")
             else:
                 # Display "no target" message
                 cv2.putText(frame, "No valid humans detected", 
-                           (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 cv2.putText(frame, "Waiting for human with visible keypoints...", 
-                           (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             # Display frame center coordinates
             cv2.putText(frame, f"Frame Center: ({int(fx)}, {int(fy)})", 
-                       (20, H - 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+                       (10, H - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             # Display number of detected humans
             cv2.putText(frame, f"Valid humans detected: {len(active_tracks)}", 
-                       (20, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
-            
-            # Display camera info
-            cv2.putText(frame, f"Rapoo Full HD: {W}x{H} @ {actual_fps:.1f} FPS", 
-                       (W - 600, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3)
+                       (10, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             # Show frame
-            cv2.imshow("Rapoo - Human Pose Tracking (Full HD)", frame)
+            cv2.imshow("Human Pose Tracking - Chest Center", frame)
             
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
@@ -466,7 +450,7 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        print("Rapoo camera pipeline completed")
+        print("Pipeline completed")
 
 if __name__ == "__main__":
     main()
